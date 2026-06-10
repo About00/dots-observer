@@ -24,10 +24,26 @@ namespace DotsObserver
             _scopes.Add(scope);
             return scope;
         }
-
+        
+        public EntityScope<T> Watch<T>(ref SystemState state, Entity entity, EntityQuery customQuery)
+            where T : unmanaged, IComponentData
+        {
+            var scope = EntityScope<T>.Create(ref state, customQuery, _config, entity);
+            _scopes.Add(scope);
+            return scope;
+        }
+        
         public EntityScope<T> WatchAll<T>(ref SystemState state) where T : unmanaged, IComponentData
         {
             var scope = EntityScope<T>.CreateWildcard(ref state, _config);
+            _scopes.Add(scope);
+            return scope;
+        }
+        
+        public EntityScope<T> WatchAll<T>(ref SystemState state, EntityQuery customQuery)
+            where T : unmanaged, IComponentData
+        {
+            var scope = EntityScope<T>.Create(ref state, customQuery, _config, Entity.Null);
             _scopes.Add(scope);
             return scope;
         }

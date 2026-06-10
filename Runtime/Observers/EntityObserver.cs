@@ -25,7 +25,25 @@ namespace DotsObserver
         private IObserverUpdateScheduler<T> _scheduler;
         private NativeList<Entity> _entitiesToRemove;
         private NativeArray<int> _eventCounterArr;
+        private JobHandle _pendingHandle;
+        private bool _isEnabled;
+        
+        public ObserverConfig Config => _config;
+        public Entity WatchedEntity => _watchedEntity;
+        public NativeParallelHashMap<Entity, ObserverEntityState<T>> State => _state;
+        public NativeParallelHashMap<Entity, byte> CurrentSet => _currentSet;
+        public NativeQueue<ChangeEvent<T>> Events => _events;
+        public NativeArray<int> EventCounter => _eventCounterArr;
+        public int MaxWriteEvents => _config.MaxEventsPerFrame;
+        public bool IsEnabled => _isEnabled;
+        public int FrameCounter => _frameCounter;
 
+        internal void IncrementFrameCounter() => _frameCounter++;
+        internal void ResetFrameCounter() => _frameCounter = 0;
+        internal void ClearCurrentSet() => _currentSet.Clear();
+        internal void ResetEventCounter() => _eventCounterArr[0] = 0;
+        internal void SetEnabled(bool value) => _isEnabled = value;
+        
         // === ISystem API ===
         public void OnCreate(ref SystemState state, in ObserverConfig config, Entity watchedEntity = default)
         {
@@ -33,7 +51,7 @@ namespace DotsObserver
             _watchedEntity = watchedEntity;
             _frameCounter = config.UpdateInterval - 1;
             _processedCount = 0;
-
+            
             var builder = new EntityQueryBuilder(Allocator.Temp).WithAll<T>();
             if (config.TrackEnableable && TypeTraits<T>.IsEnableable)
                 builder.WithOptions(EntityQueryOptions.IgnoreComponentEnabledState);
@@ -51,10 +69,35 @@ namespace DotsObserver
             _eventCounterArr  = new NativeArray<int>(1, Allocator.Persistent);
 
             _scheduler = UpdateSchedulerFactory.Create<T>(config.TrackEnableable);
+            _isEnabled = true;
+        }
+        
+        public void OnCreate(ref SystemState state, in ObserverConfig config, EntityQuery customQuery, Entity watchedEntity = default)
+        {
+            _config        = config;
+            _watchedEntity = watchedEntity;
+            _frameCounter  = config.UpdateInterval - 1;
+            _processedCount = 0;
+
+            _query        = customQuery;
+            _handle       = state.GetComponentTypeHandle<T>(true);
+            _entityHandle = state.GetEntityTypeHandle();
+
+            int cap = config.MaxEventsPerFrame > 0 ? config.MaxEventsPerFrame : 64;
+            _state            = new NativeParallelHashMap<Entity, ObserverEntityState<T>>(cap, Allocator.Persistent);
+            _events           = new NativeQueue<ChangeEvent<T>>(Allocator.Persistent);
+            _currentSet       = new NativeParallelHashMap<Entity, byte>(cap, Allocator.Persistent);
+            _entitiesToRemove = new NativeList<Entity>(cap, Allocator.Persistent);
+            _eventCounterArr  = new NativeArray<int>(1, Allocator.Persistent);
+
+            _scheduler = UpdateSchedulerFactory.Create<T>(config.TrackEnableable);
+            _isEnabled = true;
         }
 
         public void Update(ref SystemState state)
         {
+            if (!_isEnabled) return;
+            
             _frameCounter++;
             if (_frameCounter < _config.UpdateInterval) return;
             _frameCounter = 0;
@@ -96,7 +139,7 @@ namespace DotsObserver
                 MaxWriteEvents       = _config.MaxEventsPerFrame
             };
 
-            state.Dependency = cleanupJob.Schedule(updateHandle);
+            _pendingHandle = state.Dependency = cleanupJob.Schedule(updateHandle);
         }
 
         public NativeArray<ChangeEvent<T>> UpdateAndFlush(ref SystemState state, Allocator allocator)
@@ -148,10 +191,35 @@ namespace DotsObserver
             _eventCounterArr    = new NativeArray<int>(1, Allocator.Persistent);
 
             _scheduler = UpdateSchedulerFactory.Create<T>(config.TrackEnableable);
+            _isEnabled = true;
+        }
+        
+        public void OnCreate(SystemBase system, in ObserverConfig config, EntityQuery customQuery, Entity watchedEntity = default)
+        {
+            _config        = config;
+            _watchedEntity = watchedEntity;
+            _frameCounter  = config.UpdateInterval - 1;
+            _processedCount = 0;
+
+            _query        = customQuery;
+            _handle       = system.GetComponentTypeHandle<T>(true);
+            _entityHandle = system.GetEntityTypeHandle();
+
+            int cap = config.MaxEventsPerFrame > 0 ? config.MaxEventsPerFrame : 64;
+            _state            = new NativeParallelHashMap<Entity, ObserverEntityState<T>>(cap, Allocator.Persistent);
+            _events           = new NativeQueue<ChangeEvent<T>>(Allocator.Persistent);
+            _currentSet       = new NativeParallelHashMap<Entity, byte>(cap, Allocator.Persistent);
+            _entitiesToRemove = new NativeList<Entity>(cap, Allocator.Persistent);
+            _eventCounterArr  = new NativeArray<int>(1, Allocator.Persistent);
+
+            _scheduler = UpdateSchedulerFactory.Create<T>(config.TrackEnableable);
+            _isEnabled = true;
         }
 
         public void Update(SystemBase system)
         {
+            if (!_isEnabled) return;
+            
             _frameCounter++;
             if (_frameCounter < _config.UpdateInterval) return;
             _frameCounter = 0;
@@ -193,7 +261,55 @@ namespace DotsObserver
                 MaxWriteEvents       = _config.MaxEventsPerFrame
             };
 
-            system.CheckedStateRef.Dependency = cleanupJob.Schedule(updateHandle);
+            _pendingHandle = system.CheckedStateRef.Dependency = cleanupJob.Schedule(updateHandle);
+        }
+        
+        internal JobHandle ScheduleUpdate(SystemBase system, JobHandle inputDep)
+        {
+            if (!_isEnabled) return inputDep;
+            
+            _frameCounter++;
+            if (_frameCounter < _config.UpdateInterval) return inputDep;
+            _frameCounter = 0;
+            
+            _events.Clear();
+            _currentSet.Clear();
+            _droppedCount = 0;
+
+            if (_config.ExecutionMode == ObserverExecutionMode.MainThread)
+            {
+                inputDep.Complete();
+                UpdateMainThread(ref system.CheckedStateRef);
+                return default;
+            }
+
+            _handle = system.GetComponentTypeHandle<T>(true);
+            _entityHandle = system.GetEntityTypeHandle();
+            _lastSystemVersion = system.LastSystemVersion;
+
+            _eventCounterArr[0] = 0;
+            JobHandle updateHandle = _scheduler.Schedule(
+                _handle, _entityHandle, _state, _currentSet,
+                _events.AsParallelWriter(),
+                _lastSystemVersion, system.GlobalSystemVersion,
+                _config, _watchedEntity, _query,
+                _eventCounterArr,
+                _config.MaxEventsPerFrame,
+                inputDep);
+
+            var cleanupJob = new EntityObserverCleanupJob<T>
+            {
+                State                = _state,
+                CurrentSet           = _currentSet,
+                Events               = _events,
+                EntitiesToRemove     = _entitiesToRemove,
+                GlobalSystemVersion  = system.GlobalSystemVersion,
+                TrackEntityLifecycle = _config.TrackEntityLifecycle,
+                EventCounter         = _eventCounterArr,
+                MaxWriteEvents       = _config.MaxEventsPerFrame
+            };
+
+            return _pendingHandle = cleanupJob.Schedule(updateHandle);
         }
         
         public NativeArray<ChangeEvent<T>> UpdateAndFlush(SystemBase system, Allocator allocator)
@@ -442,6 +558,7 @@ namespace DotsObserver
         
         public void Dispose()
         {
+            _pendingHandle.Complete();
             if (_state.IsCreated)            _state.Dispose();
             if (_events.IsCreated)           _events.Dispose();
             if (_currentSet.IsCreated)       _currentSet.Dispose();

@@ -35,6 +35,18 @@ namespace DotsObserver
             foreach (var s in _scopes)
                 s.UpdateAndFlush(ref state, allocator);
         }
+        
+        public void EnableAll()
+        {
+            foreach (var s in _scopes)
+                s.Enable();
+        }
+
+        public void DisableAll()
+        {
+            foreach (var s in _scopes)
+                s.Disable();
+        }
 
         public void DisposeAll(ref SystemState state)
         {

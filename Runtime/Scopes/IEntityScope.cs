@@ -8,6 +8,9 @@ namespace DotsObserver
     /// </summary>
     public interface IEntityScope : System.IDisposable
     {
+        bool IsEnabled { get; }
+        void Enable();
+        void Disable();
         void Update(ref SystemState state);
         void Flush(ref SystemState state, Allocator allocator = Allocator.Temp);
         void UpdateAndFlush(ref SystemState state, Allocator allocator = Allocator.Temp);

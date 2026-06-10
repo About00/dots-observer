@@ -20,6 +20,7 @@
   - [EntityScope и BufferScope](#entityscope-и-bufferscope)
   - [EntityScopeBuilder и EntityScopeGroup](#entityscopebuilder-и-entityscopegroup)
   - [Конфигурация ObserverConfig](#конфигурация-observerconfig)
+  - [Автоматический выбор планировщика](#автоматический-выбор-планировщика)
   - [API Cheatsheet](#api-cheatsheet)
 - [Лицензия](#лицензия)
 
@@ -28,7 +29,7 @@
 ## От автора
 
 Библиотека **DotsObserver** и данная документация полностью сгенерированы с помощью ИИ.  
-Проект прошёл комплексное тестирование: суммарно с пакетом **DotsObserver.MVVM** реализовано и успешно пройдено **161 unit-тест** (NUnit + Unity Test Framework), покрывающий ядро, MVVM-слой и интеграционные сценарии.
+Проект прошёл комплексное тестирование: суммарно с пакетом **DotsObserver.MVVM** реализовано и успешно пройдено **199 unit-тестов** (NUnit + Unity Test Framework), покрывающий ядро, MVVM-слой и интеграционные сценарии.
 
 ---
 
@@ -40,9 +41,14 @@
 - **События жизненного цикла**: `Created`, `Changed`, `Destroyed`, `Enabled`, `Disabled`.
 - **Burst-оптимизированные Job'ы**: `IJobChunk` с нулевой аллокацией в горячем цикле.
 - **Несколько режимов детекции изменений**: `ChangeFilterOnly`, `EqualsCheck` (MemCmp), `Both`.
+- **Автоматическая оптимизация `IEquatable<T>`**: если компонент реализует `IEquatable<T>`, планировщик автоматически переключается на `T.Equals()` вместо MemCmp.
 - **Поддержка `IEnableableComponent`**: отслеживание включения/выключения компонентов.
+- **Два режима выполнения**: `BurstJob` (по умолчанию) и `MainThread` (синхронный, без job overhead).
+- **Поддержка кастомного `EntityQuery`**: передать собственный фильтрованный запрос при создании наблюдателя.
+- **Wildcard-режим**: наблюдение за всеми entity с заданным компонентом сразу.
 - **Zero-allocation API**: `NativeQueue`, `NativeParallelHashMap`, `NativeArray` — никаких managed-аллокаций во время обновления.
 - **Managed обёртки**: `EntityScope<T>` и `BufferScope<T>` с привычными C#-событиями для UI-слоя.
+- **Enable/Disable scope'ов**: приостановка наблюдения без уничтожения объекта.
 - **Fluent builder**: `EntityScopeBuilder` для батчевой регистрации наблюдателей.
 
 ---
@@ -59,7 +65,7 @@
 
 | Символ | Описание |
 |--------|----------|
-| `DOTS_OBSERVER_USE_FNV1A` | Принудительно использует 32-битный FNV-1a для хэширования буферов вместо xxHash3. |
+| `DOTS_OBSERVER_USE_FNV1A` | Принудительно использует 32-битный FNV-1a для хэширования буферов вместо xxHash3 (по умолчанию). |
 
 ### Ссылки
 
@@ -132,6 +138,13 @@ public struct Health : IComponentData
 }
 ```
 
+| Сценарий использования                                                                    | Complete за кадр        | Примечание                                                                                                                                                                                           |
+| ----------------------------------------------------------------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **MVVM через `ObserverPresentationSystem`** (рекомендуемый)                               | **1** (централизованно) | Все batch-джобы объединяются в один `JobHandle` и завершаются единым `Complete()` в `OnUpdate`. Fallback-скопы делают дополнительные вызовы, но на уже завершённую `Dependency` (практически no-op). |
+| **`EntityScope<T>.UpdateAndFlush()`** или **`BufferScope<T>.UpdateAndFlush()`** (ISystem) | **2 × N**               | `Update()` делает `Complete()` перед очисткой очереди, `Flush()` делает второй `Complete()` перед чтением событий. N — количество scope'ов.                                                          |
+| **`EntityObserver<T>.Update()`** / **`BufferObserver<T>.Update()`** (низкоуровневый)      | **1 × N**               | Один `Complete()` на каждый observer в начале `Update()`.                                                                                                                                            |
+| **`EntityObserver<T>.UpdateAndFlush()`**                                                  | **2 × N**               | Как и у scope'ов: один в `Update()`, второй перед `FlushEvents()`.  
+
 ---
 
 ## Архитектура
@@ -183,8 +196,9 @@ stateDiagram-v2
     Destroyed --> [*] : Dispose()
 
     note right of Updating
-        Burst IJobChunk + CleanupJob
-        Sequential или Parallel
+        BurstJob: IJobChunk + CleanupJob
+        MainThread: синхронный EntityManager
+        TrackEnableable только в BurstJob
     end note
 ```
 
@@ -197,8 +211,8 @@ flowchart LR
     C -->|Managed dispatch| D[EntityScope<T>]
     D -->|ComponentCreatedHandler<br/>ComponentChangedHandler| E[UI / Logic / MVVM]
 
-    style B fill:#7FFFD4,stroke:#000,stroke-width:2px
-    style C fill:#ff2400,stroke:#333,stroke-width:2px,color:#fff
+    style B fill:#517d6e,stroke:#000,stroke-width:2px
+    style C fill:#80392e,stroke:#333,stroke-width:2px,color:#fff
 ```
 
 ---
@@ -212,8 +226,10 @@ flowchart LR
 | Метод | Описание |
 |-------|----------|
 | `OnCreate(ref SystemState, config, watchedEntity)` | Инициализация в `ISystem`. |
+| `OnCreate(ref SystemState, config, customQuery, watchedEntity)` | Инициализация с кастомным `EntityQuery`. |
 | `OnCreate(SystemBase, config, watchedEntity)` | Инициализация в `SystemBase`. |
-| `Update(ref SystemState)` / `Update(SystemBase)` | Выполняет Job'ы детекции изменений. |
+| `OnCreate(SystemBase, config, customQuery, watchedEntity)` | Инициализация в `SystemBase` с кастомным `EntityQuery`. |
+| `Update(ref SystemState)` / `Update(SystemBase)` | Выполняет Job'ы детекции изменений (или синхронное обновление в `MainThread` режиме). |
 | `FlushEvents(Allocator)` | Возвращает `NativeArray<ChangeEvent<T>>` и очищает очередь. |
 | `UpdateAndFlush(..., Allocator)` | `Update` + `FlushEvents` в одном вызове. |
 | `GetEvents(Allocator)` | Возвращает копию событий **без** очистки очереди. |
@@ -223,9 +239,11 @@ flowchart LR
 | `ClearEvents()` | Очищает очередь без возврата данных. |
 | `OnDestroy(...)` / `Dispose()` | Освобождение нативных коллекций. |
 
+> **MainThread режим**: при `ExecutionMode = ObserverExecutionMode.MainThread` обновление выполняется синхронно через `EntityManager` без шедулинга Job'а. `TrackEnableable` в этом режиме не поддерживается и будет проигнорирован.
+
 ### BufferObserver&lt;T&gt;
 
-Аналог `EntityObserver`, но для `IBufferElementData`. Использует хэширование содержимого (FNV-1a / xxHash3) для детекции изменений.
+Аналог `EntityObserver`, но для `IBufferElementData`. Использует хэширование содержимого (xxHash3 по умолчанию, FNV-1a при `DOTS_OBSERVER_USE_FNV1A`) для детекции изменений.
 
 | Метод | Описание |
 |-------|----------|
@@ -234,15 +252,27 @@ flowchart LR
 
 ### EntityScope и BufferScope
 
-Managed обёртки с C#-событиями для main-thread кода (UI, ViewModel).
+Managed обёртки с C#-событиями для main-thread кода (UI, ViewModel). Поддерживают приостановку через `Enable()` / `Disable()`.
 
 ```csharp
+// Наблюдение за конкретной entity
 var scope = EntityScope<Health>.Create(ref state, entity, config);
-scope.OnCreated += (in Entity e, in Health v) => { };
-scope.OnChanged += (in Entity e, in Health p, in Health c) => { };
+
+// Wildcard: наблюдение за всеми entity с компонентом
+var scope = EntityScope<Health>.CreateWildcard(ref state, config);
+
+// С кастомным EntityQuery
+var scope = EntityScope<Health>.Create(ref state, customQuery, config, entity);
+
+scope.OnCreated  += (in Entity e, in Health v) => { };
+scope.OnChanged  += (in Entity e, in Health p, in Health c) => { };
 scope.OnDestroyed += (in Entity e, in Health l) => { };
-scope.OnEnabled += (in Entity e, in Health v) => { };
+scope.OnEnabled  += (in Entity e, in Health v) => { };
 scope.OnDisabled += (in Entity e, in Health l) => { };
+
+scope.Enable();          // возобновить наблюдение
+scope.Disable();         // приостановить без уничтожения
+
 scope.UpdateAndFlush(ref state);
 scope.Dispose(ref state);
 ```
@@ -252,15 +282,30 @@ scope.Dispose(ref state);
 ```csharp
 // Fluent builder
 var builder = new EntityScopeBuilder(config.With(trackEntityLifecycle: true));
+
+// Наблюдение за конкретной entity
 builder.Watch<Health>(ref state, playerEntity);
 builder.Watch<Mana>(ref state, playerEntity);
+
+// Wildcard: все entity с компонентом
+builder.WatchAll<Health>(ref state);
+builder.WatchAll<Health>(ref state, customQuery);  // с фильтром
+
+// Буферы
 builder.WatchBuffer<InventoryItem>(ref state, playerEntity);
+builder.WatchAllBuffers<InventoryItem>(ref state);
+
+// С кастомным EntityQuery
+builder.Watch<Health>(ref state, playerEntity, customQuery);
+
 var group = builder.Build();
 
-// Bulk-операции
+// Bulk-операции над группой
 group.UpdateAll(ref state);
 group.FlushAll(ref state);
 group.UpdateAndFlushAll(ref state);
+group.EnableAll();
+group.DisableAll();
 group.DisposeAll(ref state);
 ```
 
@@ -270,24 +315,51 @@ group.DisposeAll(ref state);
 public struct ObserverConfig
 {
     public int UpdateInterval;        // 1 = каждый кадр
-    public ScheduleMode Mode;         // Sequential (рекомендуется)
+    public ScheduleMode Mode;         // Parallel (по умолчанию)
     public ChangeDetectionMode ChangeDetection; // Both (по умолчанию)
     public ObserverExecutionMode ExecutionMode; // BurstJob или MainThread
-    public int MaxEventsPerFrame;     // 0 = без лимита
+    public int MaxEventsPerFrame;     // 1000 по умолчанию (0 = без лимита)
     public bool TrackEntityLifecycle; // Created / Destroyed
-    public bool TrackEnableable;      // Enabled / Disabled
+    public bool TrackEnableable;      // Enabled / Disabled (только BurstJob)
     public int RingQueueCapacity;     // 0 = NativeQueue, >0 = кольцевая
     public int MaxQueueSize;          // Жёсткий лимит на выдачу
 }
 ```
+
+**Значения по умолчанию** (`ObserverConfig.Default`):
+
+| Поле | Значение |
+|------|----------|
+| `UpdateInterval` | 1 |
+| `Mode` | `Parallel` |
+| `ChangeDetection` | `Both` |
+| `ExecutionMode` | `BurstJob` |
+| `MaxEventsPerFrame` | **1000** |
+| `TrackEntityLifecycle` | `false` |
+| `TrackEnableable` | `false` |
+| `RingQueueCapacity` | 0 |
+| `MaxQueueSize` | 0 |
 
 Создание через `With(...)`:
 ```csharp
 var config = ObserverConfig.Default.With(
     trackEntityLifecycle: true,
     changeDetection: ChangeDetectionMode.EqualsCheck,
-    executionMode: ObserverExecutionMode.MainThread);
+    executionMode: ObserverExecutionMode.MainThread,
+    maxEventsPerFrame: 500);
 ```
+
+### Автоматический выбор планировщика
+
+`EntityObserver<T>` автоматически выбирает оптимальный планировщик в зависимости от типа компонента:
+
+| Условие | Планировщик | Поведение |
+|---------|-------------|-----------|
+| `T : IEnableableComponent` + `trackEnableable: true` | `EnableableUpdateScheduler<T>` | Отслеживает `Enabled`/`Disabled` |
+| `T : IEquatable<T>` | `EquatableUpdateScheduler<T>` | Использует `T.Equals()` вместо MemCmp |
+| Всё остальное | `RegularUpdateScheduler<T>` | MemCmp для сравнения |
+
+Выбор происходит единожды при `OnCreate` через рефлексию; runtime-стоимость равна нулю.
 
 ### API Cheatsheet
 
@@ -299,22 +371,37 @@ observer.Update(ref systemState);
 var events = observer.FlushEvents(Allocator.Temp);
 events.Dispose();
 
+// === EntityObserver c кастомным запросом ===
+observer.OnCreate(ref systemState, config, myCustomQuery);
+
 // === EntityScope (Managed) ===
 var scope = EntityScope<Health>.Create(ref state, entity, config);
 scope.OnChanged += (e, p, c) => { };
+scope.Enable();
+scope.Disable();
 scope.UpdateAndFlush(ref state);
 scope.Dispose(ref state);
+
+// === EntityScope wildcard ===
+var wildScope = EntityScope<Health>.CreateWildcard(ref state, config);
 
 // === BufferScope ===
 var bScope = BufferScope<InventoryItem>.Create(ref state, entity, config);
 bScope.OnBufferChanged += (e) => { };
 
+// === BufferScope wildcard ===
+var bWild = BufferScope<InventoryItem>.CreateWildcard(ref state, config);
+
 // === Builder + Group ===
 var builder = new EntityScopeBuilder(ObserverConfig.Default.With(trackEntityLifecycle: true));
 builder.Watch<Health>(ref state, entity);
+builder.WatchAll<Mana>(ref state);
 builder.WatchBuffer<InventoryItem>(ref state, entity);
+builder.WatchAllBuffers<InventoryItem>(ref state);
 var group = builder.Build();
 group.UpdateAndFlushAll(ref state);
+group.EnableAll();
+group.DisableAll();
 group.DisposeAll(ref state);
 
 // === Config ===
@@ -322,7 +409,8 @@ var cfg = ObserverConfig.Default.With(
     updateInterval: 2,
     changeDetection: ChangeDetectionMode.Both,
     maxEventsPerFrame: 500,
-    trackEnableable: true);
+    trackEnableable: true,
+    executionMode: ObserverExecutionMode.MainThread);
 ```
 
 ---

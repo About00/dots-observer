@@ -1,4 +1,5 @@
-﻿using Unity.Collections;
+﻿using System;
+using Unity.Collections;
 using Unity.Entities;
 
 namespace DotsObserver
@@ -10,11 +11,16 @@ namespace DotsObserver
     {
         private BufferObserver<T> _observer;
         private bool _disposed;
+        private bool _isEnabled = true;
 
         public event BufferCreatedHandler<T> OnBufferCreated;
         public event BufferChangedHandler<T> OnBufferChanged;
         public event BufferDestroyedHandler<T> OnBufferDestroyed;
 
+        public bool IsEnabled => _isEnabled;
+        public void Enable()  => _isEnabled = true;
+        public void Disable() => _isEnabled = false;
+        
         public static BufferScope<T> Create(ref SystemState state, Entity entity, in ObserverConfig config)
         {
             var scope = new BufferScope<T>();
@@ -33,13 +39,15 @@ namespace DotsObserver
 
         public void Update(ref SystemState state)
         {
-            if (_disposed) throw new System.ObjectDisposedException(nameof(BufferScope<T>), "[DotsObserver] Scope already disposed.");
+            if (_disposed) throw new ObjectDisposedException(nameof(BufferScope<T>), "[DotsObserver] Scope already disposed.");
+            if (!_isEnabled) return;
             _observer.Update(ref state);
         }
 
         public void Flush(ref SystemState state, Allocator allocator = Allocator.Temp)
         {
-            if (_disposed) throw new System.ObjectDisposedException(nameof(BufferScope<T>), "[DotsObserver] Scope already disposed.");
+            if (_disposed) throw new ObjectDisposedException(nameof(BufferScope<T>), "[DotsObserver] Scope already disposed.");
+            if (!_isEnabled) return;
             state.Dependency.Complete();
             _observer.FlushToManagedEvents(evt =>
             {
@@ -60,7 +68,7 @@ namespace DotsObserver
 
         public void UpdateAndFlush(ref SystemState state, Allocator allocator = Allocator.Temp)
         {
-            if (_disposed) throw new System.ObjectDisposedException(nameof(BufferScope<T>), "[DotsObserver] Scope already disposed.");
+            if (_disposed) throw new ObjectDisposedException(nameof(BufferScope<T>), "[DotsObserver] Scope already disposed.");
             Update(ref state);
             Flush(ref state, allocator);
         }
